@@ -190,3 +190,104 @@ def test_inspect_report_to_dict_includes_synthid():
         has_ai_metadata=False,
     )
     assert empty.to_dict()["synthid"] is None
+
+
+def test_synthid_score_http_blocks_redirect(tmp_path: Path):
+    """Ensure _synthid_score_http refuses 302 redirects to prevent SSRF and key leakage."""
+    import http.server
+    import threading
+
+    state: dict = {"collector_port": None}
+    captured: dict = {}
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{state['collector_port']}/leak",
+            )
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    class Collector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            captured["hit"] = True
+            self.send_response(200)
+            self.end_headers()
+
+        def do_POST(self):
+            captured["hit"] = True
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    collector = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    redirector = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirector)
+    state["collector_port"] = collector.server_address[1]
+    t1 = threading.Thread(target=collector.serve_forever, daemon=True)
+    t2 = threading.Thread(target=redirector.serve_forever, daemon=True)
+    t1.start()
+    t2.start()
+
+    img = tmp_path / "target.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    try:
+        res = image_meta._synthid_score_http(
+            img,
+            f"http://127.0.0.1:{redirector.server_address[1]}",
+            api_key="secret-key",
+            timeout=2.0,
+        )
+        assert res is not None
+        assert res.get("available") is False
+        assert (
+            "unreachable" in res.get("error", "").lower()
+            or "httperror" in res.get("error", "").lower()
+        )
+        assert captured == {}, "redirect target must not receive any forwarded request"
+    finally:
+        collector.shutdown()
+        redirector.shutdown()
+
+
+def test_synthid_http_uses_passed_data_not_a_reread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_synthid_score_http must build the request from supplied bytes and not
+    re-read the path (§4). A missing on-disk file plus data= proves it: the read
+    branch would return a 'cannot read' error, and the request body must carry
+    the passed bytes."""
+    import base64
+    import urllib.request
+
+    captured: dict[str, bytes] = {}
+
+    class _FakeResp:
+        def __enter__(self) -> _FakeResp:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps({"available": True, "score": 0.1}).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None):  # type: ignore[no-untyped-def]
+        captured["body"] = req.data
+        return _FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    missing = tmp_path / "never-created.png"
+    res = image_meta._synthid_score_http(missing, "http://sidecar.local", "", 1.0, data=b"PNGBYTES")
+
+    assert res == {"available": True, "score": 0.1}
+    sent = json.loads(captured["body"].decode("utf-8"))
+    assert base64.b64decode(sent["file"]) == b"PNGBYTES"

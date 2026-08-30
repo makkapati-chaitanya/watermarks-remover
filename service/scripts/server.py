@@ -42,6 +42,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from functools import cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,6 +53,8 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from av_meta import clean_av, inspect_av
+from clean_audio import audio_purify, is_audio_format, is_audio_name, media_has_video
+from clean_video import video_purify
 from common import (
     MAX_INPUT_BYTES,
     eprint,
@@ -85,9 +88,11 @@ MAX_BATCH_FILES = int(os.environ.get("WATERMARKS_MAX_BATCH_FILES", "50"))
 ALLOWED_CLEAN_OPTIONS = {
     "nfkc": bool,
     "aggressive_homoglyphs": bool,
+    "normalize_spaces": bool,
     "keep_non_ai_metadata": bool,
     "also_layer_a_text": bool,
     "remove_pixel": str,
+    "remove_audio_watermark": bool,
     "strip_all_metadata": bool,
     "detect_before": bool,
     "detect_after": bool,
@@ -128,7 +133,13 @@ def _json_ok(payload: dict[str, Any]) -> bytes:
 
 # Flag that makes each tool print its version and exit 0. They disagree:
 # exiftool treats `--version` as an unknown option and prints usage instead.
-_VERSION_FLAG = {"c2patool": "--version", "exiftool": "-ver", "qpdf": "--version"}
+_VERSION_FLAG = {
+    "c2patool": "--version",
+    "exiftool": "-ver",
+    "qpdf": "--version",
+    # ffmpeg has no --version; it exits 8 and the probe read that as unusable.
+    "ffmpeg": "-version",
+}
 
 
 @cache
@@ -169,6 +180,7 @@ def capabilities() -> dict[str, Any]:
             "exiftool": _tool_usable("exiftool"),
             "qpdf": _tool_usable("qpdf"),
             "ghostscript": _ghostscript_usable(),
+            "ffmpeg": _tool_usable("ffmpeg"),
         },
         "pixel_backends": {
             "ctrlregen": bool(os.environ.get("NOAI_WATERMARK_DIR")),
@@ -193,6 +205,96 @@ def capabilities() -> dict[str, Any]:
 
 def _schema(**props: Any) -> dict[str, Any]:
     return props
+
+
+# Plain-language meaning of each evidence class, keyed by class name. Shared by
+# the OpenAPI schema and the runtime payload so the two never drift.
+_SUSPICIOUS_CLASS_DESCRIPTIONS = {
+    "provenance": (
+        "Observable, deterministic provenance metadata (C2PA/Content Credentials "
+        "or AI-metadata markers) embedded in the file. Strongest evidence class: "
+        "directly inspectable, not inferred."
+    ),
+    "layer_a_unicode": (
+        "Invisible/format Unicode carriers (Layer A) detected in the text body. "
+        "Deterministic but edit-based: a known carrier was present, not proof of "
+        "AI authorship."
+    ),
+    "watermark_detector": (
+        "A positive result from a detector configured for a specific watermark "
+        "scheme. Strong only for that scheme; it is not evidence of any other mark."
+    ),
+    "stylometry": (
+        "Stylometric AI-density score reached the threshold. Heuristic and "
+        "statistical: weaker than observable metadata and subject to false positives."
+    ),
+}
+
+
+def _suspicious_schema() -> dict[str, Any]:
+    """OpenAPI schema for the structured `suspicious` evidence object."""
+
+    def cls(name: str, strength: str, signals: dict[str, Any]) -> dict[str, Any]:
+        """Build the schema for one evidence class."""
+        return _schema(
+            type="object",
+            properties={
+                "present": _schema(type="boolean"),
+                "strength": _schema(type="string", description=strength),
+                "description": _schema(
+                    type="string", description=_SUSPICIOUS_CLASS_DESCRIPTIONS[name]
+                ),
+                "signals": _schema(type="object", properties=signals),
+            },
+        )
+
+    return _schema(
+        type="object",
+        description=(
+            "Heterogeneous evidence for suspected marking, reported per evidence "
+            "class so callers can weigh each signal instead of trusting one boolean. "
+            "Not a single provenance judgment."
+        ),
+        properties={
+            "verdict": _schema(type="boolean"),
+            "description": _schema(type="string"),
+            "classes": _schema(
+                type="object",
+                properties={
+                    "provenance": cls(
+                        "provenance",
+                        "definitive",
+                        {
+                            "has_c2pa": _schema(type="boolean"),
+                            "has_ai_metadata": _schema(type="boolean"),
+                        },
+                    ),
+                    "layer_a_unicode": cls(
+                        "layer_a_unicode",
+                        "deterministic",
+                        {"suspicious_total": _schema(type="integer")},
+                    ),
+                    "watermark_detector": cls(
+                        "watermark_detector",
+                        "scheme_specific",
+                        {
+                            "detected_any": _schema(type="boolean"),
+                            "detectors": _schema(type="array", items=_schema(type="object")),
+                        },
+                    ),
+                    "stylometry": cls(
+                        "stylometry",
+                        "heuristic",
+                        {
+                            # Non-text assets have no stylometry, so these are null.
+                            "score": _schema(type="number", nullable=True),
+                            "density_tier": _schema(type="string", nullable=True),
+                        },
+                    ),
+                },
+            ),
+        },
+    )
 
 
 def _file_request(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -259,7 +361,7 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                             type="object",
                             properties={
                                 k: _schema(type="boolean")
-                                for k in ("c2patool", "exiftool", "qpdf", "ghostscript")
+                                for k in ("c2patool", "exiftool", "qpdf", "ghostscript", "ffmpeg")
                             },
                         ),
                         "pixel_backends": _schema(
@@ -327,7 +429,7 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                     properties={
                         "ok": _schema(type="boolean"),
                         "kind": _schema(type="string", enum=["text", "image", "container", "av"]),
-                        "suspicious": _schema(type="boolean"),
+                        "suspicious": _suspicious_schema(),
                         "report": _schema(type="object"),
                     },
                 )
@@ -406,7 +508,7 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                                         type="string",
                                         enum=["text", "image", "container", "av", "unknown"],
                                     ),
-                                    "suspicious": _schema(type="boolean"),
+                                    "suspicious": _suspicious_schema(),
                                     "report": _schema(type="object"),
                                     "error": _schema(type="string"),
                                 },
@@ -668,14 +770,72 @@ def _batch_items(
     return items
 
 
+def _suspicious_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Break the collapsed `suspicious` boolean into explicit evidence classes.
+
+    Each class keeps its own evidentiary weight and a plain-language
+    `description`, so a downstream agent can weigh the signals rather than
+    treating one boolean as a unified provenance judgment.
+    """
+    detectors = report.get("text_detectors") or []
+    detected_wm = any(entry.get("available") and entry.get("is_watermarked") for entry in detectors)
+    stylometry = report.get("stylometry") or {}
+    styl_score = stylometry.get("score") or 0.0
+    styl_present = stylometry.get("status") == "ok" and styl_score >= 0.65
+
+    classes = {
+        "provenance": {
+            "present": bool(report.get("has_c2pa") or report.get("has_ai_metadata")),
+            "strength": "definitive",
+            "description": _SUSPICIOUS_CLASS_DESCRIPTIONS["provenance"],
+            "signals": {
+                "has_c2pa": bool(report.get("has_c2pa")),
+                "has_ai_metadata": bool(report.get("has_ai_metadata")),
+            },
+        },
+        "layer_a_unicode": {
+            "present": bool(report.get("suspicious_total")),
+            "strength": "deterministic",
+            "description": _SUSPICIOUS_CLASS_DESCRIPTIONS["layer_a_unicode"],
+            "signals": {"suspicious_total": report.get("suspicious_total", 0)},
+        },
+        "watermark_detector": {
+            "present": detected_wm,
+            "strength": "scheme_specific",
+            "description": _SUSPICIOUS_CLASS_DESCRIPTIONS["watermark_detector"],
+            "signals": {"detected_any": detected_wm, "detectors": detectors},
+        },
+        "stylometry": {
+            "present": styl_present,
+            "strength": "heuristic",
+            "description": _SUSPICIOUS_CLASS_DESCRIPTIONS["stylometry"],
+            "signals": {
+                "score": stylometry.get("score"),
+                "density_tier": stylometry.get("density_tier"),
+            },
+        },
+    }
+
+    return {
+        "verdict": any(c["present"] for c in classes.values()),
+        "description": (
+            "Combined across heterogeneous evidence classes. A hint to inspect "
+            "further, not a single provenance judgment: a file flagged here is "
+            "not necessarily watermark-free or human-authored."
+        ),
+        "classes": classes,
+    }
+
+
 def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]:
+    """Inspect a file and return findings plus a structured suspicious report."""
     kind = classify_bytes(data, Path(name).suffix)
     if kind == "unknown":
         return {
             "ok": True,
             "kind": "unknown",
             "report": {"note": "unrecognized format; use a filename with a known extension"},
-            "suspicious": False,
+            "suspicious": _suspicious_report({}),
         }
     with tempfile.TemporaryDirectory(prefix="wm-inspect-") as tmp:
         path = _tmp_path(Path(tmp), name or "input")
@@ -692,22 +852,12 @@ def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]
             if run_detect:
                 report["text_detectors"] = run_all_text_detectors(raw_text)
         elif kind == "image":
-            report = inspect_image(path).to_dict()
+            report = inspect_image(path, data=data).to_dict()
         elif kind == "av":
-            report = inspect_av(path).to_dict()
+            report = inspect_av(path, data=data).to_dict()
         else:
-            report = inspect_container(path).to_dict()
-    detected_wm = any(
-        entry.get("available") and entry.get("is_watermarked")
-        for entry in report.get("text_detectors") or []
-    )
-    suspicious = (
-        bool(report.get("suspicious_total"))
-        or bool(report.get("has_c2pa") or report.get("has_ai_metadata"))
-        or bool(report.get("stylometry", {}).get("score", 0.0) >= 0.65)
-        or detected_wm
-    )
-    return {"ok": True, "kind": kind, "report": report, "suspicious": suspicious}
+            report = inspect_container(path, data=data).to_dict()
+    return {"ok": True, "kind": kind, "report": report, "suspicious": _suspicious_report(report)}
 
 
 def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
@@ -726,7 +876,7 @@ def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
             detections.append({"detector": "stylometry", "available": True, **s_rep.to_dict()})
             return {"ok": True, "kind": kind, "detections": detections}
         elif kind == "image":
-            score = run_synthid_score(path)
+            score = run_synthid_score(path, data=data)
             if score is None:
                 score = {
                     "detector": "synthid",
@@ -745,11 +895,11 @@ def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
                 "ok": True,
                 "kind": kind,
                 "detections": [],
-                "report": inspect_av(path).to_dict(),
+                "report": inspect_av(path, data=data).to_dict(),
             }
         else:
             detections = []
-            report = inspect_container(path).to_dict()
+            report = inspect_container(path, data=data).to_dict()
             return {
                 "ok": True,
                 "kind": kind,
@@ -785,6 +935,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 text,
                 nfkc=bool(options.get("nfkc")),
                 aggressive_homoglyphs=bool(options.get("aggressive_homoglyphs")),
+                normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
             if detect_after:
                 detector_reports["after"] = run_text_detectors(cleaned)
@@ -823,7 +974,70 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
+            remove_pixel = options.get("remove_pixel")
+            if remove_pixel not in (None, "ctrlregen", "diffusion"):
+                raise ValueError("remove_pixel must be one of: ctrlregen, diffusion")
             result = clean_av(src, dest, strip_all_metadata=strip_all)
+            # Only run the audio chain on audio-only media. WAV/MP3/FLAC are
+            # definitive audio containers (no video stream possible); the
+            # MP4-family/OGG audio names (.m4a/.aac/.ogg/.opus) could be a
+            # mislabeled video, so only treat those as audio when a stream probe
+            # confirms there is no video track (an inconclusive probe is not
+            # "no video", to avoid dropping a video track via the -vn re-encode).
+            definitely_audio = is_audio_format(result.get("format", ""))
+            is_audio = definitely_audio or (is_audio_name(name) and media_has_video(src) is False)
+            if is_audio and options.get("remove_audio_watermark"):
+                # The container-clean dest above is "out" + the input suffix, so an
+                # .m4a input made both paths "out.m4a". ffmpeg refuses to edit a file
+                # in place, which silently skipped the chain while /clean still 200'd,
+                # so keep the re-encode dest literally distinct (an input suffix can
+                # never be "-audio.m4a").
+                audio_dest = _tmp_path(tmpdir, "out-audio.m4a")
+                audio_res = audio_purify(dest, audio_dest)
+                result["audio_mark_removal"] = audio_res
+                if audio_res.get("available"):
+                    dest = audio_dest
+                    result["actions"].append(
+                        f"destructive audio watermark chain (tempo {audio_res.get('tempo')}x, "
+                        f"{audio_res.get('pitch_semitones'):+.1f} semitones, "
+                        f"{audio_res.get('codec')})"
+                    )
+                    # The chain re-encodes to M4A, so the metadata-clean report
+                    # fields are stale; recompute them from the final file and
+                    # reflect the new container, not the source format.
+                    after = inspect_av(dest)
+                    result["format"] = after.format
+                    result["bytes_out"] = dest.stat().st_size
+                    result["changed"] = True
+                    result["still_has_c2pa"] = after.has_c2pa
+                    result["still_has_ai_metadata"] = after.has_ai_metadata
+                    result["post_findings"] = after.findings
+                else:
+                    result["actions"].append(
+                        "destructive audio watermark chain skipped: "
+                        f"{audio_res.get('error', 'unknown error')}"
+                    )
+            elif remove_pixel:
+                pix = video_purify(dest, dest, remove_pixel=remove_pixel)
+                result["pixel_removal"] = pix
+                engine = "CtrlRegen" if remove_pixel == "ctrlregen" else "DiffusionPurification"
+                if pix.get("available"):
+                    result["actions"].append(
+                        f"{engine} per-frame video purification "
+                        f"({pix.get('frames_purified')}/{pix.get('frames_total')} frames)"
+                    )
+                    # The remux re-encodes the video, so the metadata-clean
+                    # report fields are stale; recompute them from the final file.
+                    after = inspect_av(dest)
+                    result["bytes_out"] = dest.stat().st_size
+                    result["changed"] = True
+                    result["still_has_c2pa"] = after.has_c2pa
+                    result["still_has_ai_metadata"] = after.has_ai_metadata
+                    result["post_findings"] = after.findings
+                else:
+                    result["actions"].append(
+                        f"per-frame video purification skipped: {pix.get('error', 'unknown error')}"
+                    )
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "av", **result}
         else:
@@ -852,6 +1066,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 fmt=container_fmt,
                 also_layer_a_text=bool(options.get("also_layer_a_text", True)),
                 deep_images=str(options.get("deep_images", "auto")),
+                normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "container", **result}
@@ -870,7 +1085,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"watermarks-remover/{VERSION}"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        eprint(f"{self.address_string()} - {fmt % args}")
+        # Local time with UTC offset, e.g. "2026-08-27 14:03:11 +0300" — readable
+        # without conversion, and unambiguous across timezones/DST.
+        stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+        eprint(f"[{stamp}] {self.address_string()} - {fmt % args}")
 
     def _authorized(self) -> bool:
         if not API_KEY:
@@ -958,7 +1176,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             self._respond(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(e)})
         except Exception as e:
-            eprint(f"error handling {path}: {e!r}")
+            self.log_error("error handling %s: %r", path, e)
             self._respond(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "internal error"}
             )
